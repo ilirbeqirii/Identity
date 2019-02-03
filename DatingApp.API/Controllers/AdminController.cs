@@ -7,6 +7,10 @@ using Microsoft.EntityFrameworkCore;
 using DatingApp.API.Dtos;
 using Microsoft.AspNetCore.Identity;
 using DatingApp.API.Models;
+using Microsoft.Extensions.Options;
+using DatingApp.API.Helpers;
+using CloudinaryDotNet;
+using CloudinaryDotNet.Actions;
 
 namespace DatingApp.API.Controllers
 {
@@ -16,11 +20,23 @@ namespace DatingApp.API.Controllers
     {
         private readonly DataContext _dataContext;
         private readonly UserManager<User> _userManager;
+        private readonly IOptions<CloudinarySettings> _cloudinaryConfig;
+        private Cloudinary _cloudinary;
 
-        public AdminController(DataContext dataContext, UserManager<User> userManager)
+        public AdminController(DataContext dataContext, UserManager<User> userManager,
+            IOptions<CloudinarySettings> cloudinaryConfig)
         {
+            _cloudinaryConfig = cloudinaryConfig;
             _dataContext = dataContext;
             _userManager = userManager;
+
+            Account acc = new Account(
+                _cloudinaryConfig.Value.CloudName,
+                _cloudinaryConfig.Value.ApiKey,
+                _cloudinaryConfig.Value.ApiSecret
+            );
+
+            _cloudinary = new Cloudinary(acc);
         }
 
         [Authorize(Policy = "RequireAdminRole")]
@@ -51,23 +67,76 @@ namespace DatingApp.API.Controllers
             var userRoles = await _userManager.GetRolesAsync(user);
             var selectedRoles = roleEditDto.RoleNames;
 
-            selectedRoles = selectedRoles ?? new string[] {};
+            selectedRoles = selectedRoles ?? new string[] { };
             var result = await _userManager.AddToRolesAsync(user, selectedRoles.Except(userRoles));
             if (!result.Succeeded)
                 return BadRequest("Failed to add roles");
-            
+
             result = await _userManager.RemoveFromRolesAsync(user, userRoles.Except(selectedRoles));
             if (!result.Succeeded)
                 return BadRequest("Failed to remove the roles");
-            
+
             return Ok(await _userManager.GetRolesAsync(user));
         }
 
         [Authorize(Policy = "ModeratePhotoRole")]
         [HttpGet("photosForModeration")]
-        public IActionResult GetPhotosForModeration()
+        public async Task<IActionResult> GetPhotosForModeration()
         {
-            return Ok("Admins or moderators can see this");
+            var photos = await _dataContext.Photos
+                            .Include(x => x.User)
+                            .IgnoreQueryFilters()
+                            .Where(x => x.IsApproved == false)
+                            .Select(x => new
+                            {
+                                Id = x.Id,
+                                UserName = x.User.UserName,
+                                Url = x.Url,
+                                IsApproved = x.IsApproved
+                            }).ToListAsync();
+
+            return Ok(photos);
+        }
+
+        [Authorize(Policy = "ModeratePhotoRole")]
+        [HttpPost("approvePhoto/{photoId}")]
+        public async Task<IActionResult> ApprovePhoto(int photoId)
+        {
+            var photo = await _dataContext.Photos.IgnoreQueryFilters().FirstOrDefaultAsync(x=>x.Id == photoId);
+            photo.IsApproved = true;
+
+            await _dataContext.SaveChangesAsync();
+
+            return Ok();
+        }
+
+        [Authorize(Policy = "ModeratePhotoRole")]
+        [HttpPost("rejectPhoto/{photoId}")]
+        public async Task<IActionResult> RejectPhoto(int photoId)
+        {
+            var photo = await _dataContext.Photos.IgnoreQueryFilters().FirstOrDefaultAsync(x=>x.Id == photoId);
+
+            if (photo.IsMain)
+                return BadRequest("You cannot reject the main photo");
+
+            if (photo.PublicId != null)
+            {
+                var deleteParams = new DeletionParams(photo.PublicId);
+                var result = _cloudinary.Destroy(deleteParams);
+
+                if (result.Result == "ok")
+                {
+                    _dataContext.Remove(photo);
+                }
+            }    
+
+            if (photo.PublicId == null)
+            {
+                _dataContext.Remove(photo);
+            }            
+
+            await _dataContext.SaveChangesAsync();
+            return Ok();
         }
     }
 }
